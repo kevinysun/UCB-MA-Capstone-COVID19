@@ -1,0 +1,743 @@
+---
+title: "Epidemiological Modeling of COVID-19"
+author: "Kevin Sun, Mallika Snyder, and Ian Shen"
+output:
+  html_document:
+    df_print: paged
+urlcolor: blue
+---
+
+## Dataset and Dependencies
+
+First, as in the previous EDA, load/install all relevant dependencies. 
+
+```{r message=FALSE, warning=FALSE}
+require(zoo) #Data wrangling
+require(tidyverse) #Data wrangling
+require(lubridate) #For date variables
+require(naniar) # analysis of missing values
+require(broom) #Tidy regression output
+require(kableExtra) #For tables
+library(reshape2)
+require(purrr)
+require(msm)
+require(boot)
+
+#If covidAgeData is not installed, run this step 
+# remotes::install_github("eshom/covid-age-data")
+require(covidAgeData) #Obtaining Covid-19 case and death data
+```
+
+Also load relevant functions, and specify plot sizes.
+
+```{r}
+'%ni%' <- Negate('%in%') #Useful for specifying elements not in a vector
+
+knitr::opts_chunk$set(fig.width=6, fig.height=4) #Specifying plot sizes
+```
+
+We next re-download, load, and tidy the COVerAGE-DB dataset used for most estimates. Since we describe the epidemic curve based on the rolling average of cases (in order to smooth over issues in day-to-day reporting), we calculate this 7-day moving average for cases and deaths. This was described in more detail in our first EDA. 
+
+```{r message=FALSE, warning=FALSE}
+#Download the data and subset it using functions from the package covidAgeData
+coverage <- download_covid("inputDB") #Full data
+ca_data <- subset_covid(coverage, Country = "USA", #Data for CA only
+                        Region = "California")
+```
+
+```{r message=FALSE, warning=FALSE}
+measure_data <- ca_data %>%
+  filter(Measure %in% c("Deaths", "Cases") & Sex == "b" &
+           Age %in% c("0", "18", "50", "65")) %>% #These are lower bounds
+  mutate(age_group = if_else(Age == "0", "0-17", #Desired age intervals
+                     if_else(Age == "18", "18-49",
+                     if_else(Age == "50", "50-64",
+                     if_else(Age == "65", "65+", NA_character_)))),
+         date = as_date(Date, #Converting string date to object
+                        format = "%d.%m.%Y")) %>% 
+  filter(age_group %ni% NA_character_) %>% #Removing any potential problem obs
+  select(date, Measure, Value, age_group) %>% #Removing irrelevant identifiers
+  pivot_wider(names_from = "Measure", values_from = "Value")
+
+#Change variable names to lowercase for greater convenience
+names(measure_data) <- tolower(names(measure_data))
+
+#Calculate daily lagged data, then right-aligned rolling averages
+measure_data_final <- measure_data %>%
+  group_by(age_group) %>% 
+  mutate(lag = lag(date), 
+         deaths_daily = ifelse(lag == lag(date), deaths - lag(deaths), NA),
+         cases_daily = ifelse(lag == lag(date), cases - lag(cases), NA)) %>%
+  arrange(date) %>%
+  ungroup() %>%
+  group_by(age_group) %>%
+  mutate(cases_daily_ma = rollmeanr(cases_daily,7, fill = NA),
+         deaths_daily_ma = rollmeanr(deaths_daily,7, fill = NA),
+         infected_ma = rollsumr(cases_daily_ma, 16, fill = NA)) %>%
+  arrange(date) %>%
+  filter(date >= "2020-10-01")
+
+```
+
+## Our Model
+
+Our model of the epidemic's course, as described in previous work, is an SEIRD deterministic compartmental model where each age group's cases are modeled separately. Some parameters are age-specific, while others that rely more on the natural history of the disease are not. This can be summarized by the following equations: 
+
+$$
+\frac{dS_x}{dt} = b \times 1(x = 0-17) \times N-\frac{\beta_x I}{N}S_x - (m_{b}+v_x)S_x
+$$
+
+$$
+\frac{dE_x}{dt} = \frac{\beta_x I}{N}S_x-(m_{b}+f)E_x
+$$
+$$
+\frac{dI_x}{dt} = fE_x-\left(m_{b}+(1-IFR_{x})r_x+IFR_{x}m_x\right)I_x
+$$
+
+$$
+\frac{dR_x}{dt} = (1-IFR_{x})r_xI_x+v_xS_x-m_{b}Rx
+$$
+
+$$
+\frac{dD_x}{dt} = IFR_{x}m_xI_x
+$$
+
+$$
+N = S+E+I+R+D
+$$
+
+where $x$ refers to the age interval of interest, S refers to individuals susceptible to the disease, E refers to individuals exposed to the disease, I refers to individuals infected with the disease, R refers to individuals who have recovered from the disease, and D refers to those who die of the disease. The sum of the D compartments across all ages is our outcome of interest, since we are interested in determining which vaccination prioritization strategies would lead to the lowest mortality due to the disease. The other parameters are: the age-specific effective rate of contact between infectious and susceptible individuals $\beta_x$, the reciprocal of the latent period ($f$), the reciprocal of the infectious period ($r$), the age-specific infection fatality ratio ($IFR_x$), the reciprocal of the time from symptoms to death ($m$), the background mortality rate $m_b$, and the background birth rate $b$ (which is only relevant for the 0-17 age group).
+
+## Estimating Parameters
+Our analysis involves first estimating parameters for an age-specific SEIRD model for each age group, and then simulating the effect of various vaccination prioritization scenarios on the trajectory of the pandemic. Most parameters, such as the latent period or the infectious period, are epidemiologically determined constants that we can use directly from the literature. A table of these constants is provided below: 
+\par
+\begin{table}
+\caption{\label{tab:parms}Starting Parameter Values}
+   \begin{tabular}{|c|c|c|c|}
+    \hline
+    \footnotesize
+    Variable & Definition & Value & Reference \\ [0.5ex]
+    \hline \hline
+    $f$ & 1/Duration of Latent Period & 1/6 = 0.167 days$^{-1}$ & CDC (2021a) \\
+    \hline
+    $r$ &1/Duration of Infectious Period & 1/10 = 0.1 days$^{-1}$ & CDC (2021b) \\
+    \hline
+    $m_{0-17}$ &1/Time from Symptom Onset to Death & 1/10 = 0.1 days$^{-1}$ & CDC (2021a) \\
+    \hline
+    $m_{18-49}$ &1/Time from Symptom Onset to Death & 1/17 = 0.0589 days$^{-1}$ & CDC (2021a) \\
+    \hline
+    $m_{18-64}$ &1/Time from Symptom Onset to Death & 1/19 = 0.0526 days$^{-1}$ & CDC (2021a) \\
+    \hline
+    $m_{65+}$ &1/Time from Symptom Onset to Death & 1/16 = 0.0625 days$^{-1}$ & CDC (2021a) \\
+    \hline
+    $IFR_{0-17}$ & Infection Fatality Ratio & $20/10^6 = 0.00002$ & CDC (2021a) \\
+    \hline
+    $IFR_{18-49}$ & Infection Fatality Ratio & $500/10^6 = 0.0005$ & CDC (2021a) \\
+    \hline
+    $IFR_{49-64}$ & Infection Fatality Ratio & $6000/10^6 = 0.006$ & CDC (2021a) \\
+    \hline
+    $IFR_{65+}$ & Infection Fatality Ratio & $90000/10^6 = 0.09$ & CDC (2021a) \\
+    \hline
+    $b$ & US Birth rate & 11.6/1000 year$^{-1}$ & CDC (2017a) \\
+    \hline
+     $m_b$ & US Death rate & 8.6/1000 year$^{-1}$ & CDC (2017b) \\
+     \hline
+    \end{tabular}
+    \end{table}
+\par
+However, we still require estimates of the effective rate of contact $\beta$ for each group, since this is more specific to local conditions and individual health behaviors. This should be calculated for as short a period as is relevant in order to allow for changes in health behaviors throughout the pandemic, and need only be calculated for the period of exponential growth from early November 2020 to mid-December 2020 (when the first vaccines began to become available); this period of exponential growth can be observed on the following graph, where we see a linear increase in log cases starting around November: 
+
+```{r}
+measure_data_final %>% filter(date <= "2020-12-22") %>% 
+  ggplot() + geom_line(aes(x = date, y = log(cases_daily_ma), color = age_group)) + labs(x = "Date", y = "Log of Daily Cases (7-Day MA)", color = "Age group") + theme_bw()
+```
+We will use th time period from November 1, 2020 to December 15, 2020 for our fitting, as this is where the log is linear. At December 22 we see the log beginning to level off; similarly with time before Nov 1. 
+
+
+### Frequentist Estimation
+
+While we intend to supplement this calculation with MCMC based methods in subsequent work, we provide preliminary estimates below based on a simpler approach that is nevertheless still employed in the literature, estimating $\beta$ based on the period of exponential growth of the epidemic (Vynnycky and White, 2010). This is based on the idea that in the initial phase of an outbreak (we can consider the start of a wave similarly), cases increase exponentially, so that 
+
+$$
+I(t) = I(0)e^{at}
+$$
+where $a$ is a growth rate that is closely related to R0 and $\beta$. Therefore, we see that the log of cases is linearly related to the growth rate. 
+
+$$\log I(t) = \log I(0) + at $$
+This equation is derived, as shown in Vynnycky and White (2010) by the approximation that at the early stages of an epidemic, the susceptible population is very similar in size to the total population; given the size of the California population, and the presence of variants, this seems a reasonable assumption. Although our model is slightly different from theirs (we include background mortality, for example, and adjust for the infection fatality ratio), this approach provides a preliminary approximation, since background mortality and fertility are unlikely to alter model dynamics to a great degree, and Covid-19 patients are similarly infectious regardless of eventual disease outcome.      
+\par
+We can then calculate $R_0$ from this by the formula derived in Vynnycky and White (2010):
+$$
+R_0 = (1+aD)(1+aF)
+$$
+where D is the duration of the infectious period,and F is the duration of the latent period. 
+$\beta$ can then be calculated by the relationship between $R_0$ and $\beta$:
+$$\beta = \frac{R_0}{D+F} $$
+Let us calculate these values of $a$ for each age and estimate $R_0$ and $\beta$; we assume the period of exponential growth begins on October 1, 2020, and ends on December 31, 2020, to account for any delays in vaccine distribution after approval.
+
+```{r}
+#Obtain models by age group
+models_by_age <- measure_data_final %>%
+  #Only include observations up till the end of December
+  filter(date >= "2020-11-01" & date <= "2020-12-15") %>% 
+  mutate(time = row_number()) %>%
+  group_by(age_group) %>%
+  do(model = lm(log(cases_daily_ma) ~ time, data = .))
+```
+
+```{r}
+#Tidy this output to obtain coefficients
+coefficients <- unlist(lapply(1:nrow(models_by_age), function(x) {
+  val <- tidy(models_by_age$model[[x]]) %>%
+    filter(term == "time") %>%
+    pull(estimate)
+  
+  return(val)
+}
+  ))
+
+#Calculate R0 and beta by age
+params <- tibble(age_group = models_by_age$age_group,
+                 a = coefficients,
+                 R0 = (1+10*a)*(1+6*a),
+                 beta = R0/(10 + 6)) 
+
+params %>% kable()
+
+```
+
+
+
+The $R_0$ values thus obtained are lower than the current best estimate of 2.5 in the CDC Pandemic Planning Scenarios (CDC 2021a), but well over the value of 1 needed for an epidemic to grow exponentially; since little specificity is provided in the CDC report about the context on which this estimate is based, it is possible that the CDC estimate is taking into account geographical areas where the epidemic has a higher $R_0$ than that seen in this wave of the California epidemic.  
+
+
+### Sensitivity Analysis
+We did sensitivity analysis on the MA window:
+
+First define some functions:
+```{r, echo=FALSE}
+#function for fitting betas with OLS depending on parameters
+frequentist_betas <- function(measure_data, # dataframe
+                              start_date,   # start date for frequentist fitting
+                              end_date,     # end date for frequentist fitting
+                              MA_window     # how many days for rolling average
+){  
+  #Calculate daily lagged data, then right-aligned rolling averages
+  measure_data_final <- measure_data %>%
+    group_by(age_group) %>% 
+    mutate(lag = lag(date), 
+           deaths_daily = ifelse(lag == lag(date), deaths - lag(deaths), NA),
+           cases_daily = ifelse(lag == lag(date), cases - lag(cases), NA)) %>%
+    arrange(date) %>%
+    ungroup() %>%
+    group_by(age_group) %>%
+    mutate(cases_daily_ma = rollmeanr(cases_daily,MA_window, fill = NA),
+           deaths_daily_ma = rollmeanr(deaths_daily,MA_window, fill = NA)) %>%
+    arrange(date)
+  #Obtain models by age group
+  models_by_age <- measure_data_final %>%
+    filter(date >= start_date & date <= end_date) %>% 
+    mutate(time = row_number()) %>%
+    group_by(age_group) %>%
+    do(model = lm(log(cases_daily_ma) ~ time, data = .))
+  
+  # calculate the variance
+  summary_by_age <- lapply(models_by_age$model, summary)
+  cov_by_age <- lapply(models_by_age$model, vcov)
+  
+  
+  #Tidy this output to obtain coefficients
+  coefficients <- unlist(lapply(1:nrow(models_by_age), function(x) {
+    val <- tidy(models_by_age$model[[x]]) %>%
+      filter(term == "time") %>%
+      pull(estimate)
+    
+    return(val)
+  }
+  ))
+  
+  
+  coeff_sesq <- cov_by_age %>% map(~.x[2, 2]) %>% unlist()
+
+  
+  #delta method for se of R_0, beta
+  R0_sesq <- rep(0,nrow(models_by_age))
+  for(i in 1:nrow(models_by_age)){
+    R0_sesq[i] <- deltamethod(~(1+10*x1)*(1+6*x1), coefficients[i], 
+                               coeff_sesq[i])
+  }
+  beta0_sesq <- R0_sesq/((10+6)^2)
+  #Calculate R0 and beta by age
+  params <- tibble(age_group = models_by_age$age_group,
+                   a = coefficients,
+                   R0 = (1+10*a)*(1+6*a),
+                   beta = R0/(10 + 6),
+                   R0_se = sqrt(R0_sesq),
+                   beta_se = sqrt(beta0_sesq))
+  
+  params <- params %>%
+    rename(Age = "age_group")
+  return(params)
+}
+```
+
+
+Then we do the analysis:
+```{r}
+####################
+# Investigate sensitivity with regards to how many days we use with moving average
+# calculation, depending on a time period
+
+MA_sens_analysis <- function(start_date, end_date, 
+                             MA_windows = seq(from = 2, to = 28, by = 2)){
+
+  betas <- vector("list", length(MA_windows))
+  for (i in 1:length(MA_windows)){
+    param <- frequentist_betas(measure_data = measure_data, 
+                               start_date = start_date,
+                               end_date = end_date,
+                               MA_window = MA_windows[i])
+    betas[[i]] <- param
+  }
+  
+  names(betas) <- MA_windows
+  sensitivity <- list("0-17"=NULL, "18-49"=NULL, "50-64"=NULL, "65+"=NULL)
+  for (i in 1:4){
+    
+    for (j in 1:length(MA_windows)){
+      sensitivity[[i]][j] <- betas[[j]]$R0[i]
+    }
+  }
+  
+  sensitivity_se <- list("0-17"=NULL, "18-49"=NULL, "50-64"=NULL, "65+"=NULL)
+  for (i in 1:4){
+    
+    for (j in 1:length(MA_windows)){
+      sensitivity_se[[i]][j] <- betas[[j]]$R0_se[i]
+    }
+  }
+  
+  
+  sensitivities_MA <- data.frame(sensitivity)
+  sensitivities_MA_se <- data.frame(sensitivity_se)
+  names(sensitivities_MA) <- c("0-17", "18-49", "50-64", "65+")
+  names(sensitivities_MA_se) <- c("0-17", "18-49", "50-64", "65+")
+  
+  sensitivities_MA_se <- sensitivities_MA_se %>% mutate("window" = MA_windows) %>% 
+    pivot_longer(!window, names_to = "Age", values_to = "R0_se") %>% select(R0_se)
+  
+  sensitivities_MA <- sensitivities_MA %>% mutate("window" = MA_windows) %>% 
+    pivot_longer(!window, names_to = "Age", values_to = "R0") %>% mutate(sensitivities_MA_se)
+  
+  return(sensitivities_MA)
+}
+
+############
+#Analysis
+sensitivities_MA <- MA_sens_analysis(start_date = "2020-11-01",
+                                      end_date = "2020-12-15")
+
+
+point_est <- MA_sens_analysis(start_date = "2020-11-01",
+                              end_date = "2020-12-15", MA_windows = 7)
+
+
+sensitivities_MA %>% mutate(beta = R0/16, beta_se = R0_se/16) %>% 
+  ggplot() + aes(x=window, y=R0/16, color=Age)+
+  geom_line()+geom_point()+  
+  geom_ribbon(aes(ymin=beta-beta_se, ymax=beta+beta_se), linetype=2, alpha=0.1)+
+  labs(x = "Days for Moving Average Calculation", 
+       y = "Frequentist Beta estimate", color = "Age Group",
+      title = "Frequentist Beta sensitivity to MA window length (11-1-20 to 12-15-20)")
+
+```
+
+We see that our estimates decrease as the MA window increases, which is likely due to how much we are smoothing the data. We will stick with 7 days.
+
+
+### Bootstrap 
+
+To get a sense of the uncertainty of our estimates, we use bootstrap methods. We uniformly sample the start date and end date from a 2-week window (where the start and end date for our point estimate is at the center). We then run regressions with those samples to get a set of estimates. We continue to use ordinary least squares for its simplicity and computation speed, but we will not be using the standard errors derived from each model, since we do not have enough evidence to assume homoscedasticity and a normal linear model. 
+
+```{r}
+#### Bootstrap for nonparametric measure of uncertainty
+start_range <- seq(as.Date("2020/10/22"), as.Date("2020/11/07"), "days")
+end_range <-  seq(as.Date("2020/12/07"), as.Date("2020/12/22"), "days")
+#ma_window_range <-  c(3, 7, 14)
+
+nboot <-  1000
+start_boot <-  sample(start_range, size = nboot, replace = TRUE)
+end_boot <-  sample(end_range, size = nboot, replace = TRUE)
+#ma_boot <- sample(ma_window_range, size = nboot, replace = TRUE) 
+
+betas <- vector("list", nboot)
+for (i in 1:nboot){
+  
+  param <- frequentist_betas(measure_data = measure_data, 
+                               start_date = start_boot[i],
+                               end_date = end_boot[i],
+                               MA_window = 7)
+  betas[[i]] <- param
+
+}
+
+
+beta_boot <- list("0-17"=NULL, "18-49"=NULL, "50-64"=NULL, "65+"=NULL)
+R0_boot <- list("0-17"=NULL, "18-49"=NULL, "50-64"=NULL, "65+"=NULL)
+for (i in 1:4){
+  
+  for (j in 1:nboot){
+    beta_boot[[i]][j] <- betas[[j]]$beta[i]
+    R0_boot[[i]][j] <- betas[[j]]$R0[i]
+  }
+}
+
+
+beta_boot <- data.frame(beta_boot)
+R0_boot <- data.frame(R0_boot)
+names(beta_boot) <- c("0-17", "18-49", "50-64", "65+")
+names(R0_boot) <- c("0-17", "18-49", "50-64", "65+")
+
+beta <- sapply(beta_boot, mean)
+R0 <- sapply(R0_boot, mean)
+beta_boot_se <- sapply(beta_boot, sd)
+R0_boot_se <- sapply(R0_boot, sd)
+```
+
+```{r}
+beta_boot %>% pivot_longer(everything(), names_to = "Age") %>% 
+  ggplot() + aes(x = value) + geom_histogram(binwidth = 0.001) + facet_wrap( ~ Age)
+
+```
+
+Looking at the distribution of our bootstrapped betas, we see that it does indeed not appear normal, so we will use percentile intervals. The underlying assumptions as les2s strict for percentile intervals -- we just assume that there is some transformation that could make our distributions normal. 
+
+```{r}
+beta_quant <- sapply(beta_boot, quantile, probs = c(0.025, 0.975))
+R0_quant <- sapply(R0_boot, quantile, probs = c(0.025, 0.975))
+
+beta_df <- data.frame(age_group = names(beta), beta = beta, 
+                      beta_lower = beta_quant[1,], beta_upper = beta_quant[2,],
+                      row.names = NULL)
+
+beta_df
+beta_df %>% mutate(beta = round(beta, digits = 3)) %>% 
+  ggplot() + aes(x = age_group, y = beta) + 
+  geom_point(size = 5, shape = 18) + 
+  geom_errorbar(aes(ymin=beta_lower, ymax=beta_upper), width = 0.5) + ylim(0.10, 0.125) +
+  labs(title = 'Beta estimates by age group, with bootstrap 95% percentile interval', x = 'Age Group', y = 'Beta') +
+  geom_text(mapping = aes(label = beta, y = 0.107), size = 7)
+
+```
+
+
+## Simulated Outcomes
+
+Infected after vaccination
+```{r}
+seir_measured <- measure_data %>%
+  group_by(age_group) %>% 
+  mutate(lag = lag(date), 
+         deaths_daily = ifelse(lag == lag(date), deaths - lag(deaths), NA),
+         cases_daily = ifelse(lag == lag(date), cases - lag(cases), NA)) %>%
+  arrange(date) %>%
+  ungroup() %>%
+  group_by(age_group) %>%
+  mutate(cases_daily_ma = rollmeanr(cases_daily,7, fill = NA),
+         deaths_daily_ma = rollmeanr(deaths_daily,7, fill = NA),
+         infected_ma = rollsumr(cases_daily_ma, 10, fill = NA)) %>%
+  arrange(date) %>%
+  filter(date >= "2020-10-01") %>% ungroup() %>% 
+  group_by(date) %>% 
+  summarise(date = unique(date), infected = sum(infected_ma), 
+            deaths = sum(deaths_daily_ma))
+  
+
+seir_measured <-  seir_measured %>% filter(date > '2021-01-01') %>% arrange(date) 
+seir_measured$deaths[1] <- 26000
+
+seir_measured <- seir_measured %>% 
+  mutate(deathsum = cumsum(deaths))
+
+
+
+seir_measured %>% ggplot() + geom_line(aes(x = date, y = infected, color = 'Infected')) + 
+  geom_line(aes(x = date, y = deathsum, color = 'Dead')) + 
+  labs(title = 'Population, Measured since 01-01-2021', 
+       x = 'Date', y = 'Number of People in Group')
+```
+
+### Vaccination
+
+After determining our model parameters, the final input required is a model of vaccination rates over time by age. To get a sense of how this played out in the California case, we plot data on vaccination by age. Fortunately, daily data is available from the California Department of Public Health from December 15, 2020 (December 21 if we calculate a 7-day moving average) to April 30,2021, which begins just after our vaccination period occurs and goes up till the present day. We focus on full vaccination (1 or 2 doses, as the case may be), which is a lower bound estimate of vaccination-based population immunity. We can plot the time series of full vaccinations by age, also calculating a 7-day moving average as with cases and deaths, below:
+
+```{r}
+#Read data on vaccinations by demographic group
+vacc_demog <- read_csv("covid19vaccinesadministeredbydemographics.csv") %>%
+  filter(demographic_category == "Age Group", 
+         demographic_value != "Unknown Agegroup")
+```
+
+```{r}
+vacc_demog %>%
+  group_by(demographic_value) %>%
+  arrange(administered_date) %>%
+  mutate(vacc_ma = rollmeanr(fully_vaccinated, 7, NA)) %>%
+  filter(!is.na(vacc_ma)) %>%
+  ggplot() + geom_line(aes(x = administered_date, 
+                           y = vacc_ma, 
+                           color = demographic_value)) + 
+  labs(x = "Date", y = "Fully Vaccinated, 7-day MA", 
+       title = "Daily Full Vaccinations by Age",
+       color = "Age Group") +
+  theme_bw()
+
+ggsave("vacc_age.png")
+```
+In our simulations, we consider trajectories that depart from this model--we think of vaccination prioritization in terms of either equal priority given to all ages, or as a model in which each age group prioritized is fully vaccinated before switching to the next age group. 
+
+In the next code chunk, we create a cleaned dataframe of vaccinations over time for potential later use in our simulations.
+
+```{r}
+vacc_scenarios <- vacc_demog %>%
+  group_by(demographic_value) %>%
+  arrange(administered_date) %>%
+  mutate(vacc_ma = rollmeanr(fully_vaccinated, 7, NA)) %>%
+  filter(!is.na(vacc_ma)) %>%
+  mutate(demographic_value = substr(demographic_value, 1, 2),
+         demographic_value = gsub("-", "", demographic_value),
+         date = administered_date) %>%
+    select(demographic_value, date, vacc_ma) %>%
+  pivot_wider(id_cols = date, 
+              names_from = demographic_value, names_prefix = "vacc_", 
+              values_from = vacc_ma)
+```
+
+
+### Modeling Trajectories
+
+```{r}
+# Arguments that go into the seir() function:
+# population: Total number of people, living and dead.
+# init_infectious, init_exposed, etc: People infectious, exposed, etc. at the start of the model.
+# beta_f: Average people infected by a given infectious person per day. Can act as a function of time.
+# incubation_days: Time from when a person is exposed to when they're infectious.
+# recovery_days: Time it takes someone to either recover or die from the disease.
+# ifr: Infection fatality rate- percentage of infections that are fatal. This will vary by age group.
+# birthrate, deathrate: Additional births and deaths outside of COVID, measured per person per day. Default values are based on US figures.
+# vacc_f: Rate of vaccination per day- is a function of time to reflect changes in production rates.
+# days: Amount of days we want the model to simulate.
+
+#library(dplyr)
+seir= function(population,init_infectious,
+               init_exposed=init_infectious/10,init_recovered=0,init_dead=0,
+               beta_f,incubation_days=6,recovery_days=10,
+               ifr,vacc_f,days=100){
+  # Initial values for S, E, I, R, and D populations
+  susc = population-init_infectious-init_exposed-init_recovered-init_dead
+  exp = init_exposed
+  inf = init_infectious
+  rec = init_recovered
+  dead = init_dead
+  living = population-init_dead
+  # Initialize our vectors that will be storing SEIRD populations over time.
+  Svec = susc
+  Evec = exp
+  Ivec = inf
+  Rvec = rec
+  Dvec = dead
+  Lvec = living
+  for(i in 1:days-1){
+    # Calculate the number of infections- people moving from S to E.
+    infections = round(beta_f(i)*susc*inf/population)
+    # Calculate how many exposed people become infectious
+    incubations = round(exp/incubation_days)
+    # Calculate how many infectious people recover or die- this will vary by IFR, which varies by age.
+    deaths = round(inf/recovery_days*ifr)
+    recoveries = round((inf/recovery_days)*(1-ifr))
+    # Calculate how many vaccinations are done upon the susceptible.
+    # We assume vaccinations are done equally upon all living groups and have no effect on the non-susceptible.
+    vaccs = round(vacc_f(i)*susc/living)
+    # Update all groups:
+    susc = susc-infections-vaccs
+    exp = exp+infections-incubations
+    inf = inf+incubations-recoveries-deaths
+    rec = rec+recoveries+vaccs
+    dead = dead+deaths
+    living = living-deaths
+    # Update all vectors:
+    Svec = c(Svec,susc)
+    Evec = c(Evec,exp)
+    Ivec = c(Ivec,inf)
+    Rvec = c(Rvec,rec)
+    Dvec = c(Dvec,dead)
+    Lvec = c(Lvec,living)
+  }
+  # Output a data frame with all our vectors
+  data.frame(Day=0:days,Susceptible=Svec,Exposed=Evec,Infectious=Ivec,
+             Recovered=Rvec,Dead=Dvec,Living=Lvec)
+}
+
+```
+
+```{r}
+capop = 39500000
+f_beta = function(t){0.117}
+# Define the vaccination function with coefficients from a prior linear regression of CDC
+# vaccine data, flattening in a change point on Day 105(April 15th)
+f_vacc_linear = function(t){
+  if(t<=105){34089+3625*t}
+  else{414714}}
+
+sixtyfiveplus = 5850000
+# Estimate init_exp as number of new infections from Jan 1 to Jan 7
+init_exp_old = 267362 - 243143
+ifr_old = 0.09
+init_rec_old = 243143*2
+# Estimate init_inf as number of new infections from Dec 21 to Jan 1
+init_inf_old = 243143 - 201338
+init_dead_old = 19545
+f_vacc_line = function(t){if(t<15){0}
+   else{f_vacc_linear(t-14)/2}
+   }
+seir_old = seir(sixtyfiveplus,init_inf_old,init_exp_old,
+                init_rec_old, init_dead_old,f_beta,ifr=ifr_old,
+                vacc_f=f_vacc_line,days=200)
+
+midagepop = 6900000
+init_exp_mid = 487547 - 444733
+ifr_mid = 0.006
+init_rec_mid = 444733*2
+init_inf_mid = 444733 - 362733
+init_dead_mid = 4874
+f_vacc_linear = function(t){34089+3625*t}
+# Complete prioritization means seniors are vaccinated by Day 63; younger age groups receive no vaccine until then.
+f_vacc_lineM = function(t){if(t<(15+48)){0}
+  else{f_vacc_linear(t-14)/2}
+}
+seir_mid = seir(midagepop,init_inf_mid,init_exp_mid,
+                init_rec_mid, init_dead_mid,f_beta,ifr=ifr_mid,
+                vacc_f=f_vacc_lineM,days=200)
+
+youngadultpop = 17750000
+init_exp_ya = 1497244 - 1372058
+ifr_ya = 0.0005
+init_rec_ya = 1372058*2
+init_inf_ya = 1372058 - 1134542
+init_dead_ya = 1807
+# Complete prioritization means those 50+ are vaccinated by Day 89; younger age groups receive no vaccine until then.
+f_vacc_lineY = function(t){if(t<(15+74)){0}
+  else{f_vacc_linear(t-14)/2}
+}
+seir_ya = seir(youngadultpop,init_inf_ya,init_exp_ya,
+                init_rec_ya, init_dead_ya,f_beta,ifr=ifr_ya,
+                vacc_f=f_vacc_lineY,days=200)
+
+childpop = 9000000
+init_exp_c = 314694 - 284404
+ifr_c = 0.00002
+init_rec_c = 284404*2
+init_inf_c = 284404 - 229284
+init_dead_c = 6
+# Children (outside of a few 16-17 for Pfizer) are not approved to get vaccinated, thus our functional vaccination rate for them is 0.
+f_vacc_lineC = function(t){0}
+seir_c = seir(childpop,init_inf_c,init_exp_c,
+               init_rec_c, init_dead_c,f_beta,ifr=ifr_c,
+               vacc_f=f_vacc_lineC,days=200)
+
+# Our total prioritized model adds together the values from all age brackets.
+seir_priority = seir_old+seir_mid+seir_ya+seir_c
+seir_priority$Day = 1:201
+seir_priority1 = seir_priority[,c(1,3,4,6)]
+seir_long = seir_priority1 %>% gather(key="group",value="value",-Day)
+priorplot = ggplot(seir_long,aes(x=Day,y=value,color=group)) + geom_line()+
+  labs(x="Day",y="People In Group",title="Population, Vaccines Prioritized")
+
+init_exp_t = sum(init_exp_old,init_exp_mid,init_exp_ya,init_exp_c)
+ifr_t = (sixtyfiveplus*ifr_old+midagepop*ifr_mid+youngadultpop*ifr_ya+childpop*ifr_c)/capop
+init_rec_t = sum(init_rec_old,init_rec_mid,init_rec_ya,init_exp_c)
+init_inf_t = sum(init_inf_old,init_inf_mid,init_inf_ya,init_inf_c)
+init_dead_t = sum(init_dead_old,init_dead_mid,init_dead_ya,init_dead_c)
+
+seir_equal = seir(capop,init_inf_t,init_exp_t,
+              init_rec_t, init_dead_t,f_beta,ifr=ifr_t,
+              vacc_f=f_vacc_line,days=200)
+seir_equal1 = seir_equal[,c(1,3,4,6)]
+seir_long = seir_equal1 %>% gather(key="group",value="value",-Day)
+eqplot = ggplot(seir_long,aes(x=Day,y=value,color=group)) + geom_line()+
+     labs(x="Day",y="People In Group",title="Population, Vaccines Not Prioritized")
+
+## Upper Bounds
+
+f_betahigh = function(t){0.121}
+f_betahigh2 = function(t){0.119}
+
+useir_old = seir(sixtyfiveplus,init_inf_old,init_exp_old,
+                init_rec_old, init_dead_old,f_betahigh,ifr=ifr_old,
+                vacc_f=f_vacc_line,days=200)
+useir_mid = seir(midagepop,init_inf_mid,init_exp_mid,
+                init_rec_mid, init_dead_mid,f_betahigh,ifr=ifr_mid,
+                vacc_f=f_vacc_lineM,days=200)
+useir_ya = seir(youngadultpop,init_inf_ya,init_exp_ya,
+               init_rec_ya, init_dead_ya,f_betahigh2,ifr=ifr_ya,
+               vacc_f=f_vacc_lineY,days=200)
+useir_c = seir(childpop,init_inf_c,init_exp_c,
+              init_rec_c, init_dead_c,f_betahigh,ifr=ifr_c,
+              vacc_f=f_vacc_lineC,days=200)
+useir_priority = useir_old+useir_mid+useir_ya+seir_c
+useir_priority$Day = 1:201
+useir_priority1 = useir_priority[,c(1,3,4,6)]
+useir_long = useir_priority1 %>% gather(key="group",value="value",-Day)
+
+## Low Bounds
+
+f_betalow = function(t){0.11}
+
+lseir_old = seir(sixtyfiveplus,init_inf_old,init_exp_old,
+                 init_rec_old, init_dead_old,f_betalow,ifr=ifr_old,
+                 vacc_f=f_vacc_line,days=200)
+lseir_mid = seir(midagepop,init_inf_mid,init_exp_mid,
+                 init_rec_mid, init_dead_mid,f_betalow,ifr=ifr_mid,
+                 vacc_f=f_vacc_lineM,days=200)
+lseir_ya = seir(youngadultpop,init_inf_ya,init_exp_ya,
+                init_rec_ya, init_dead_ya,f_betalow,ifr=ifr_ya,
+                vacc_f=f_vacc_lineY,days=200)
+lseir_c = seir(childpop,init_inf_c,init_exp_c,
+               init_rec_c, init_dead_c,f_betalow,ifr=ifr_c,
+               vacc_f=f_vacc_lineC,days=200)
+lseir_priority = lseir_old+lseir_mid+lseir_ya+lseir_c
+lseir_priority$Day = 1:201
+lseir_priority1 = lseir_priority[,c(1,3,4,6)]
+lseir_long = lseir_priority1 %>% gather(key="group",value="value",-Day)
+priorplot + geom_line(data=lseir_long,linetype="dashed") + geom_line(data=useir_long,linetype="dashed")
+
+lseir_equal = seir(capop,init_inf_t,init_exp_t,
+                                      init_rec_t, init_dead_t,f_betalow,ifr=ifr_t,
+                                      vacc_f=f_vacc_line,days=200)
+lseir_equal1 = lseir_equal[,c(1,3,4,6)]
+lseir_long = lseir_equal1 %>% gather(key="group",value="value",-Day)
+useir_equal = seir(capop,init_inf_t,init_exp_t,
+                                      init_rec_t, init_dead_t,f_betahigh,ifr=ifr_t,
+                                      vacc_f=f_vacc_line,days=200)
+
+
+useir_equal1 = useir_equal[,c(1,3,4,6)]
+useir_long = useir_equal1 %>% gather(key="group",value="value",-Day)
+eqplot + geom_line(data=lseir_long,linetype="dashed") + geom_line(data=useir_long,linetype="dashed")
+
+```
+
+
+
+
+## Works Cited
+
+CDC (2017a).  Births and Natality. National Center for Health Statistics.
+\par
+CDC (2017b).  Deaths and Mortality. National Center for Health Statistics.
+\par
+CDC (2021a).  COVID-19 Pandemic Planning Scenarios. \textit{COVID-19}.
+\par
+CDC  (2021b). Interim  Guidance  on  Duration  of  Isolation  and  Precautions for Adults with  COVID-19. \textit{COVID-19}.
+\par
+Vynnycky, E. and White, R.G. (2010) An Introduction to Infectious Disease Modelling. New York: \textit{Oxford University Press}.
