@@ -61,4 +61,30 @@ seir= function(population,init_infectious,
              Recovered=Rvec,Dead=Dvec,Living=Lvec))
 }
 
-
+# -------------
+measuredVacc <- function(measure_data){
+  seir_measured <- measure_data %>%
+    group_by(age_group) %>% 
+    mutate(lag = lag(date), 
+           deaths_daily = ifelse(lag == lag(date), deaths - lag(deaths), NA),
+           cases_daily = ifelse(lag == lag(date), cases - lag(cases), NA)) %>%
+    arrange(date) %>%
+    ungroup() %>%
+    group_by(age_group) %>%
+    mutate(cases_daily_ma = rollmeanr(cases_daily,7, fill = NA),
+           deaths_daily_ma = rollmeanr(deaths_daily,7, fill = NA),
+           infected_ma = rollsumr(cases_daily_ma, 10, fill = NA)) %>%
+    arrange(date) %>%
+    filter(date >= "2020-10-01") %>% ungroup() %>% 
+    group_by(date) %>% 
+    summarise(date = unique(date), infected = sum(infected_ma), 
+              deaths = sum(deaths_daily_ma))
+  
+  
+  seir_measured <-  seir_measured %>% filter(date > '2021-01-01') %>% arrange(date) 
+  seir_measured$deaths[1] <- 26000
+  
+  seir_measured <- seir_measured %>% 
+    mutate(deathsum = cumsum(deaths))
+  return(seir_measured)
+}
